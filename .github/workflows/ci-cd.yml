@@ -7,26 +7,17 @@ on:
 
 jobs:
   deploy:
-    # Map branch to environment using a tiny matrix and an IF
-    strategy:
-      matrix:
-        include:
-          - branch: dev
-            envname: dev
-          - branch: test
-            envname: test
-          - branch: master
-            envname: prod
-    if: ${{ github.ref_name == matrix.branch }}
-
     runs-on: ubuntu-latest
 
-    # Attach the job to the right GitHub Environment so its secrets are available as `secrets.*`
+    # Attach to the correct GitHub Environment so env-scoped secrets are available
+    # master -> prod, dev -> dev, test -> test
     environment:
-      name: ${{ matrix.envname }}
+      name: ${{ github.ref_name == 'master' && 'prod' || github.ref_name }}
 
     env:
       IMAGE_NAME: cicdlearn
+      # We'll reuse this in step logic and names
+      ENVNAME: ${{ github.ref_name == 'master' && 'prod' || github.ref_name }}
 
     steps:
       - name: Checkout
@@ -84,7 +75,7 @@ jobs:
         uses: azure/cli@v2
         with:
           inlineScript: |
-            APPNAME="app-cicdlearn-${{ matrix.envname }}"
+            APPNAME="app-cicdlearn-${{ env.ENVNAME }}"
             IMG="${{ env.ACR }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.TAG }}"
 
             # Create if missing (idempotent)
