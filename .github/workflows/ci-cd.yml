@@ -9,14 +9,12 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
 
-    # Attach to the correct GitHub Environment so env-scoped secrets are available
     # master -> prod, dev -> dev, test -> test
     environment:
       name: ${{ github.ref_name == 'master' && 'prod' || github.ref_name }}
 
     env:
       IMAGE_NAME: cicdlearn
-      # We'll reuse this in step logic and names
       ENVNAME: ${{ github.ref_name == 'master' && 'prod' || github.ref_name }}
 
     steps:
@@ -63,7 +61,6 @@ jobs:
           tags: ${{ env.ACR }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.TAG }}
 
       - name: Read OPENAI key from Key Vault
-        id: kv
         uses: azure/cli@v2
         with:
           inlineScript: |
@@ -71,22 +68,35 @@ jobs:
             if [ -z "$key" ]; then echo "Missing OPENAI-API-KEY in $KV" && exit 1; fi
             echo "OPENAI_KEY=$key" >> $GITHUB_ENV
 
-      - name: Enable ACR admin user (safe to run repeatedly)
+      # --- FIX START: give CAE access to ACR (env-level registry) ---
+
+      - name: Ensure Container Apps CLI extension
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az extension add --name containerapp --upgrade -y
+
+      - name: Enable ACR admin user (idempotent)
         uses: azure/cli@v2
         with:
           inlineScript: |
             az acr update -n "$ACR" --admin-enabled true
 
-      - name: Get ACR creds
+      - name: Set registry on Container Apps Environment
         uses: azure/cli@v2
         with:
           inlineScript: |
             user=$(az acr credential show -n "$ACR" --query "username" -o tsv)
             pass=$(az acr credential show -n "$ACR" --query "passwords[0].value" -o tsv)
-            echo "ACR_USER=$user" >> $GITHUB_ENV
-            echo "ACR_PASS=$pass" >> $GITHUB_ENV
+            az containerapp env registry set \
+              -g "$AZ_RG" \
+              -n "$CAE" \
+              --server "${{ env.ACR }}.azurecr.io" \
+              --username "$user" \
+              --password "$pass"
 
-      
+      # --- FIX END ---
+
       - name: Create/Update Container App
         uses: azure/cli@v2
         with:
@@ -94,7 +104,7 @@ jobs:
             APPNAME="app-cicdlearn-${{ env.ENVNAME }}"
             IMG="${{ env.ACR }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.TAG }}"
 
-            # Create if missing (idempotent). Provide registry creds so the app can pull the image.
+            # Create if missing (no registry creds needed; CAE has them)
             az containerapp create \
               -g "$AZ_RG" \
               -n "$APPNAME" \
@@ -102,19 +112,14 @@ jobs:
               --image "$IMG" \
               --ingress external --target-port 8080 \
               --registry-server "${{ env.ACR }}.azurecr.io" \
-              --registry-username "${{ env.ACR_USER }}" \
-              --registry-password "${{ env.ACR_PASS }}" \
               --query name -o tsv || true
 
-            # Update image & env
+            # Update image & env (no registry creds flags here either)
             az containerapp update \
               -g "$AZ_RG" \
               -n "$APPNAME" \
               --image "$IMG" \
-              --set-env-vars "OPENAI_API_KEY=${{ env.OPENAI_KEY }}" "PORT=8080" \
-              --registry-username "${{ env.ACR_USER }}" \
-              --registry-password "${{ env.ACR_PASS }}"
+              --set-env-vars "OPENAI_API_KEY=${{ env.OPENAI_KEY }}" "PORT=8080"
 
             echo "URL:"
             az containerapp show -g "$AZ_RG" -n "$APPNAME" --query properties.configuration.ingress.fqdn -o tsv
-
