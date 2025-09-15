@@ -1,0 +1,95 @@
+name: ci-cd
+on:
+  push:
+    branches: [ dev, test, main ]
+  workflow_dispatch:
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+# Map branch to GitHub Environment (dev/test/prod) and Azure names
+    env:
+      IMAGE_NAME: cicdlearn
+      # Decide environment name based on branch
+      DEPLOY_ENV: ${{ github.ref_name == 'main' && 'prod' || (github.ref_name == 'test' && 'test' || 'dev') }}
+steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+- name: Select GitHub Environment
+        id: pick
+        run: echo "envsel=${{ env.DEPLOY_ENV }}" >> $GITHUB_OUTPUT
+- name: Use environment variables
+        # This step switches to the selected environment to get its scoped secrets
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.info(`Deploying to environment: ${process.env.DEPLOY_ENV}`);
+- name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+- name: Read environment secrets (RG, CAE, KV) from selected environment
+        env:
+          ENVSEL: ${{ steps.pick.outputs.envsel }}
+        run: |
+          echo "ENVSEL=$ENVSEL" >> $GITHUB_ENV
+- name: Load environment-scoped secrets
+        # GitHub automatically exposes environment secrets; we map them to env vars
+        run: |
+          echo "AZ_RG=${{ secrets.AZURE_RESOURCE_GROUP }}" >> $GITHUB_ENV
+          echo "CAE=${{ secrets.CONTAINERAPPS_ENVIRONMENT }}" >> $GITHUB_ENV
+          echo "KV=${{ secrets.KEYVAULT_NAME }}" >> $GITHUB_ENV
+          echo "SUB=${{ secrets.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+          echo "TENANT=${{ secrets.AZURE_TENANT_ID }}" >> $GITHUB_ENV
+          echo "ACR=${{ secrets.ACR_NAME }}" >> $GITHUB_ENV
+- name: Azure CLI - ensure subs
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az account set --subscription "$SUB"
+- name: Docker login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR }}.azurecr.io
+          username: ${{ secrets.AZURE_CREDENTIALS != '' && fromJSON(secrets.AZURE_CREDENTIALS).clientId || '' }}
+          password: ${{ secrets.AZURE_CREDENTIALS != '' && fromJSON(secrets.AZURE_CREDENTIALS).clientSecret || '' }}
+- name: Set image tag
+        id: settag
+        run: echo "TAG=${{ github.sha }}" >> $GITHUB_OUTPUT
+- name: Build & push (linux/amd64) with buildx
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.ACR }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.settag.outputs.TAG }}
+- name: Pull OPENAI_API_KEY from Key Vault
+        id: kv
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            key=$(az keyvault secret show --vault-name "$KV" --name "OPENAI-API-KEY" --query value -o tsv)
+            if [ -z "$key" ]; then echo "Missing OPENAI-API-KEY in $KV" && exit 1; fi
+            echo "OPENAI_KEY=$key" >> $GITHUB_ENV
+- name: Create/Update Container App
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            APPNAME="app-cicdlearn-${{ env.DEPLOY_ENV }}"
+            IMG="${{ env.ACR }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.settag.outputs.TAG }}"
+            # Create CA if missing (idempotent)
+            az containerapp create \
+              -g "$AZ_RG" \
+              -n "$APPNAME" \
+              --environment "$CAE" \
+              --image "$IMG" \
+              --ingress external --target-port 8080 \
+              --registry-server "${{ env.ACR }}.azurecr.io" \
+              --query name -o tsv || true
+# Update image & secret env
+            az containerapp update \
+              -g "$AZ_RG" \
+              -n "$APPNAME" \
+              --image "$IMG" \
+              --set-env-vars "OPENAI_API_KEY=${{ env.OPENAI_KEY }}" "PORT=8080"
+# Output URL
+            az containerapp show -g "$AZ_RG" -n "$APPNAME" --query properties.configuration.ingress.fqdn -o tsv
