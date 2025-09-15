@@ -71,6 +71,22 @@ jobs:
             if [ -z "$key" ]; then echo "Missing OPENAI-API-KEY in $KV" && exit 1; fi
             echo "OPENAI_KEY=$key" >> $GITHUB_ENV
 
+      - name: Enable ACR admin user (safe to run repeatedly)
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az acr update -n "$ACR" --admin-enabled true
+
+      - name: Get ACR creds
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            user=$(az acr credential show -n "$ACR" --query "username" -o tsv)
+            pass=$(az acr credential show -n "$ACR" --query "passwords[0].value" -o tsv)
+            echo "ACR_USER=$user" >> $GITHUB_ENV
+            echo "ACR_PASS=$pass" >> $GITHUB_ENV
+
+      
       - name: Create/Update Container App
         uses: azure/cli@v2
         with:
@@ -78,7 +94,7 @@ jobs:
             APPNAME="app-cicdlearn-${{ env.ENVNAME }}"
             IMG="${{ env.ACR }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.TAG }}"
 
-            # Create if missing (idempotent)
+            # Create if missing (idempotent). Provide registry creds so the app can pull the image.
             az containerapp create \
               -g "$AZ_RG" \
               -n "$APPNAME" \
@@ -86,6 +102,8 @@ jobs:
               --image "$IMG" \
               --ingress external --target-port 8080 \
               --registry-server "${{ env.ACR }}.azurecr.io" \
+              --registry-username "${{ env.ACR_USER }}" \
+              --registry-password "${{ env.ACR_PASS }}" \
               --query name -o tsv || true
 
             # Update image & env
@@ -93,7 +111,10 @@ jobs:
               -g "$AZ_RG" \
               -n "$APPNAME" \
               --image "$IMG" \
-              --set-env-vars "OPENAI_API_KEY=${{ env.OPENAI_KEY }}" "PORT=8080"
+              --set-env-vars "OPENAI_API_KEY=${{ env.OPENAI_KEY }}" "PORT=8080" \
+              --registry-username "${{ env.ACR_USER }}" \
+              --registry-password "${{ env.ACR_PASS }}"
 
             echo "URL:"
             az containerapp show -g "$AZ_RG" -n "$APPNAME" --query properties.configuration.ingress.fqdn -o tsv
+
