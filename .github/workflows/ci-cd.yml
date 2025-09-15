@@ -17,7 +17,7 @@ jobs:
             envname: test
           - branch: master
             envname: prod
-    if: github.ref_name == matrix.branch
+    if: ${{ github.ref_name == matrix.branch }}
 
     runs-on: ubuntu-latest
 
