@@ -68,34 +68,27 @@ jobs:
             if [ -z "$key" ]; then echo "Missing OPENAI-API-KEY in $KV" && exit 1; fi
             echo "OPENAI_KEY=$key" >> $GITHUB_ENV
 
-      # --- FIX START: give CAE access to ACR (env-level registry) ---
-
       - name: Ensure Container Apps CLI extension
         uses: azure/cli@v2
         with:
           inlineScript: |
             az extension add --name containerapp --upgrade -y
 
+      # Use ACR admin creds only for the initial create so pulling the image works
       - name: Enable ACR admin user (idempotent)
         uses: azure/cli@v2
         with:
           inlineScript: |
             az acr update -n "$ACR" --admin-enabled true
 
-      - name: Set registry on Container Apps Environment
+      - name: Get ACR creds
         uses: azure/cli@v2
         with:
           inlineScript: |
             user=$(az acr credential show -n "$ACR" --query "username" -o tsv)
             pass=$(az acr credential show -n "$ACR" --query "passwords[0].value" -o tsv)
-            az containerapp env registry set \
-              -g "$AZ_RG" \
-              -n "$CAE" \
-              --server "${{ env.ACR }}.azurecr.io" \
-              --username "$user" \
-              --password "$pass"
-
-      # --- FIX END ---
+            echo "ACR_USER=$user" >> $GITHUB_ENV
+            echo "ACR_PASS=$pass" >> $GITHUB_ENV
 
       - name: Create/Update Container App
         uses: azure/cli@v2
@@ -104,7 +97,7 @@ jobs:
             APPNAME="app-cicdlearn-${{ env.ENVNAME }}"
             IMG="${{ env.ACR }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.TAG }}"
 
-            # Create if missing (no registry creds needed; CAE has them)
+            # Create if missing (pass registry creds so Container Apps can pull from ACR)
             az containerapp create \
               -g "$AZ_RG" \
               -n "$APPNAME" \
@@ -112,9 +105,11 @@ jobs:
               --image "$IMG" \
               --ingress external --target-port 8080 \
               --registry-server "${{ env.ACR }}.azurecr.io" \
+              --registry-username "$ACR_USER" \
+              --registry-password "$ACR_PASS" \
               --query name -o tsv || true
 
-            # Update image & env (no registry creds flags here either)
+            # Update image & env (no registry flags on update)
             az containerapp update \
               -g "$AZ_RG" \
               -n "$APPNAME" \
